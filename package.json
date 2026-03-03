@@ -1,0 +1,21 @@
+{
+  "name": "agentsmail",
+  "version": "1.0.0",
+  "description": "AgentsMail - Email addresses for AI agents",
+  "main": "index.js",
+  "scripts": {
+    "build": "npm run build:frontend",
+    "build:frontend": "cd frontend && npm run build",
+    "deploy": "npm run deploy:frontend && npm run deploy:worker",
+    "deploy:frontend": "wrangler pages deploy frontend/dist --project-name agentsmail",
+    "deploy:worker": "wrangler deploy",
+    "dev": "wrangler dev",
+    "dev:frontend": "cd frontend && npm run dev"
+  },
+  "keywords": ["email", "ai-agents", "cloudflare", "workers"],
+  "author": "AgentsMail",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

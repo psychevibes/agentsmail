@@ -1,0 +1,18 @@
+{
+  "name": "agentsmail-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for AgentsMail — let AI agents send and receive email",
+  "main": "index.js",
+  "bin": {
+    "agentsmail-mcp": "index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "keywords": ["mcp", "email", "ai-agents", "agentsmail"],
+  "license": "MIT"
+}

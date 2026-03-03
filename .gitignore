@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.*
+.DS_Store
+*.log
+coverage/
+.idea/
+.vscode/
+*.tgz
+
+# SDKs
+sdks/*/node_modules/
+sdks/*/dist/
+sdks/*/.eggs/
+sdks/*/*.egg-info/
+sdks/python/build/
+
+# MCP
+mcp-server/node_modules/
+
+# Stress test output
+stress-results.txt

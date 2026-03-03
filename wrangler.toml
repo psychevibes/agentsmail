@@ -1,0 +1,26 @@
+name = "agentsmail-api"
+main = "index.js"
+compatibility_date = "2024-08-19"
+account_id = "9f32fa786ad2c62e0b8f918e5857c8b6"
+
+[[kv_namespaces]]
+binding = "ACCOUNTS"
+id = "e8018c01dff84d249d0d655c78ebe2e7"
+
+[[kv_namespaces]]
+binding = "MAILBOXES"
+id = "7ffcb07af72b42ab92ea8b96ba964596"
+
+[[kv_namespaces]]
+binding = "RATE_LIMITS"
+id = "23b8f64ce98f4e44b4e6ad6a72b17c0a"
+
+[[routes]]
+pattern = "api.agentsmail.net"
+zone_name = "agentsmail.net"
+custom_domain = true
+
+[vars]
+CORS_ORIGIN = "*"
+DOMAIN = "agentsmail.net"
+MAILGUN_DOMAIN = "agentsmail.net"
