@@ -112,6 +112,7 @@ async function authenticate(request, env) {
   const failCount = parseInt(await env.RATE_LIMITS.get(failKey) || '0')
   if (failCount >= AUTH_FAIL_LIMIT.limit) {
     console.warn(`[SECURITY] Auth locked out for IP ${ip} (${failCount} failures)`)
+    await trackEvent('auth_lockout', env)
     return null
   }
 
@@ -125,6 +126,7 @@ async function authenticate(request, env) {
         // Record failed attempt
         await env.RATE_LIMITS.put(failKey, String(failCount + 1), { expirationTtl: AUTH_FAIL_LIMIT.windowSec })
         console.warn(`[SECURITY] Failed auth attempt from IP ${ip} (attempt ${failCount + 1})`)
+        await trackEvent('auth_failure', env)
         return null
       }
       // Migrate to hashed key on successful auth
@@ -149,6 +151,16 @@ async function saveAccount(account, env) {
     env.ACCOUNTS.put(`account:${account.id}`, JSON.stringify(account)),
     env.ACCOUNTS.put(`key:${keyHash}`, JSON.stringify(account)),
   ])
+}
+
+// Analytics: increment a daily counter in RATE_LIMITS KV
+async function trackEvent(name, env) {
+  const date = new Date().toISOString().slice(0, 10)
+  const key = `stats:${date}:${name}`
+  try {
+    const current = parseInt(await env.RATE_LIMITS.get(key) || '0')
+    await env.RATE_LIMITS.put(key, String(current + 1), { expirationTtl: 604800 }) // keep 7 days
+  } catch { /* best-effort */ }
 }
 
 async function checkRateLimit(key, limit, windowSec, env) {
@@ -441,6 +453,7 @@ async function handleSignup(request, env) {
   }
   if (firstMailboxAddress) result.first_mailbox = firstMailboxAddress
 
+  await trackEvent('signup', env)
   return json(result, 201, env)
 }
 
@@ -949,6 +962,7 @@ async function handleSendEmail(request, env, fromAddress, ctx) {
     if (!res.ok) {
       const errText = await res.text()
       console.error('Mailgun error:', res.status, errText)
+      await trackEvent('send_failure', env)
       return error('Failed to send email. Please try again.', 502, env)
     }
   } catch (e) {
@@ -991,6 +1005,7 @@ async function handleSendEmail(request, env, fromAddress, ctx) {
     mailbox: fromAddress, id: messageRecord.id, to, subject, thread_id: threadId,
   }, ctx)
 
+  await trackEvent('email_sent', env)
   return json({ message: 'Email sent', id: messageRecord.id, to, subject, thread_id: threadId }, 200, env)
 }
 
@@ -1245,11 +1260,32 @@ async function handleAdminStats(request, env) {
     mbCursor = list.list_complete ? null : list.cursor
   } while (mbCursor)
 
+  // Fetch analytics for last 7 days
+  const eventTypes = ['signup', 'email_sent', 'email_received', 'send_failure', 'auth_failure', 'auth_lockout', 'rate_limit_hit', 'oversized_request']
+  const analytics = { today: {}, last_7_days: {} }
+  const today = new Date().toISOString().slice(0, 10)
+
+  for (const evt of eventTypes) {
+    analytics.last_7_days[evt] = 0
+  }
+
+  for (let d = 0; d < 7; d++) {
+    const date = new Date(Date.now() - d * 86400000).toISOString().slice(0, 10)
+    for (const evt of eventTypes) {
+      try {
+        const val = parseInt(await env.RATE_LIMITS.get(`stats:${date}:${evt}`) || '0')
+        analytics.last_7_days[evt] += val
+        if (date === today) analytics.today[evt] = val
+      } catch { /* skip */ }
+    }
+  }
+
   return json({
     total_accounts: totalAccounts,
     total_mailboxes: totalMailboxes,
     plans,
     recent_signups: recent,
+    analytics,
   }, 200, env)
 }
 
@@ -1330,6 +1366,7 @@ export default {
       }, ctx)
     }
 
+    await trackEvent('email_received', env)
     console.log(`Email received: ${from} → ${to} | ${parsed.subject} | thread:${threadId} | ${parsed.attachments.length} attachments`)
   },
 
@@ -1347,6 +1384,7 @@ export default {
     if (contentLength > MAX_BODY_SIZE) {
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
       console.warn(`[SECURITY] Oversized request rejected: ${contentLength} bytes | IP: ${ip} | ${method} ${path}`)
+      await trackEvent('oversized_request', env)
       return error('Request body too large (max 1MB)', 413, env)
     }
 
@@ -1379,6 +1417,7 @@ export default {
         if (!allowed) {
           const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
           console.warn(`[SECURITY] Rate limit hit: ${isSearch ? 'search' : 'read'} | IP: ${ip} | ${path}`)
+          await trackEvent('rate_limit_hit', env)
           return error('Rate limit exceeded. Try again shortly.', 429, env)
         }
       }
