@@ -141,6 +141,12 @@ All endpoints require `Authorization: Bearer <api_key>` header (except signup an
 |--------|----------|-------------|
 | POST | `/api/signup` | Create account `{email, name?, first_mailbox?}` |
 | GET | `/api/account` | Get account info |
+| POST | `/api/account/rotate-key` | Rotate API key (returns new key, invalidates old) |
+
+### Admin
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/admin/stats` | Get signup/mailbox counts (requires `ADMIN_API_KEY`) |
 
 ### Mailboxes
 | Method | Endpoint | Description |
@@ -190,6 +196,22 @@ Events: `email.received`, `email.sent`, `mailbox.created`, `mailbox.deleted`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Health check |
+
+---
+
+## Security
+
+AgentsMail is built with security in mind:
+
+- **API key hashing** — Keys are stored as SHA-256 hashes, never in plaintext. If KV storage is compromised, your keys are safe.
+- **Key rotation** — Rotate your API key anytime via `POST /api/account/rotate-key`. Old key is immediately invalidated.
+- **Rate limiting** — Per-IP signup limits, per-account send limits, and global safety caps to prevent abuse.
+- **Webhook signature verification** — Inbound Mailgun webhooks are verified via HMAC-SHA256 signatures.
+- **Request body limits** — 1MB max request body to prevent memory exhaustion.
+- **HTTPS-only webhooks** — Webhook URLs must use HTTPS.
+- **Input sanitization** — Mailbox names, labels, search queries, and email bodies are validated and size-capped.
+- **Isolated mailboxes** — Every API call verifies mailbox ownership. Agents can only access their own data.
+- **Secrets management** — API keys and credentials stored as Cloudflare Worker secrets, never in source code.
 
 ---
 

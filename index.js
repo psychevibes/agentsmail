@@ -14,7 +14,21 @@ const PLANS = {
   startup: { max_mailboxes: 100, max_messages_per_mailbox: 5000, max_sends_per_day: 5000, max_webhooks: 10 },
 }
 
+// Global safety caps — prevents runaway bills regardless of how many accounts exist
+const GLOBAL_LIMITS = {
+  max_signups_per_day: 100,    // max 100 new accounts per day
+  max_sends_per_day: 500,      // max 500 outbound emails per day across ALL accounts
+}
+
+const MAX_BODY_SIZE = 1024 * 1024 // 1MB request body limit
+
 // ── Helpers ──
+
+async function hashApiKey(key) {
+  const encoded = new TextEncoder().encode(key)
+  const hash = await crypto.subtle.digest('SHA-256', encoded)
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
 
 function generateId(len = 16) {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -64,8 +78,22 @@ async function authenticate(request, env) {
   const apiKey = getApiKey(request)
   if (!apiKey) return null
   try {
-    const raw = await env.ACCOUNTS.get(`key:${apiKey}`)
-    if (!raw) return null
+    const keyHash = await hashApiKey(apiKey)
+    const raw = await env.ACCOUNTS.get(`key:${keyHash}`)
+    if (!raw) {
+      // Fallback: check unhashed key for backwards compatibility with existing accounts
+      const legacyRaw = await env.ACCOUNTS.get(`key:${apiKey}`)
+      if (!legacyRaw) return null
+      // Migrate to hashed key on successful auth
+      const account = JSON.parse(legacyRaw)
+      account.key_hash = keyHash
+      await Promise.all([
+        env.ACCOUNTS.put(`key:${keyHash}`, JSON.stringify(account)),
+        env.ACCOUNTS.put(`account:${account.id}`, JSON.stringify(account)),
+        env.ACCOUNTS.delete(`key:${apiKey}`),
+      ])
+      return account
+    }
     return JSON.parse(raw)
   } catch {
     return null
@@ -73,9 +101,10 @@ async function authenticate(request, env) {
 }
 
 async function saveAccount(account, env) {
+  const keyHash = account.key_hash || await hashApiKey(account.api_key)
   await Promise.all([
     env.ACCOUNTS.put(`account:${account.id}`, JSON.stringify(account)),
-    env.ACCOUNTS.put(`key:${account.api_key}`, JSON.stringify(account)),
+    env.ACCOUNTS.put(`key:${keyHash}`, JSON.stringify(account)),
   ])
 }
 
@@ -273,6 +302,10 @@ async function handleSignup(request, env) {
   const allowed = await checkRateLimit(`signup:${ip}`, 5, 3600, env)
   if (!allowed) return error('Too many signups. Try again later.', 429, env)
 
+  // Global signup cap
+  const globalSignupOk = await checkRateLimit(`global:signups:${new Date().toISOString().slice(0, 10)}`, GLOBAL_LIMITS.max_signups_per_day, 86400, env)
+  if (!globalSignupOk) return error('Service at capacity. Please try again tomorrow.', 503, env)
+
   // If first_mailbox requested, check availability before creating account
   let firstMailboxAddress = null
   if (first_mailbox) {
@@ -285,12 +318,13 @@ async function handleSignup(request, env) {
 
   const accountId = generateId(12)
   const apiKey = generateApiKey()
+  const keyHash = await hashApiKey(apiKey)
   const plan = 'free'
   const account = {
     id: accountId,
     email,
     name: name || '',
-    api_key: apiKey,
+    key_hash: keyHash,
     mailboxes: [],
     webhooks: [],
     webhook_url: null,
@@ -311,8 +345,8 @@ async function handleSignup(request, env) {
 
   await Promise.all([
     env.ACCOUNTS.put(`account:${accountId}`, JSON.stringify(account)),
-    env.ACCOUNTS.put(`key:${apiKey}`, JSON.stringify(account)),
-    env.ACCOUNTS.put(`email:${email}`, JSON.stringify({ account_id: accountId, api_key: apiKey })),
+    env.ACCOUNTS.put(`key:${keyHash}`, JSON.stringify(account)),
+    env.ACCOUNTS.put(`email:${email}`, JSON.stringify({ account_id: accountId })),
   ])
 
   const result = {
@@ -335,6 +369,28 @@ async function handleGetAccount(request, env) {
     webhook_url: account.webhook_url, plan: account.plan, limits: account.limits,
     created_at: account.created_at,
   }, 200, env)
+}
+
+// POST /api/account/rotate-key
+async function handleRotateKey(request, env) {
+  const account = await authenticate(request, env)
+  if (!account) return error('Unauthorized', 401, env)
+
+  // Delete old hashed key
+  const oldHash = account.key_hash
+  if (oldHash) await env.ACCOUNTS.delete(`key:${oldHash}`)
+
+  // Generate new key
+  const newApiKey = generateApiKey()
+  const newHash = await hashApiKey(newApiKey)
+  account.key_hash = newHash
+
+  await Promise.all([
+    env.ACCOUNTS.put(`account:${account.id}`, JSON.stringify(account)),
+    env.ACCOUNTS.put(`key:${newHash}`, JSON.stringify(account)),
+  ])
+
+  return json({ message: 'API key rotated', api_key: newApiKey }, 200, env)
 }
 
 // POST /api/mailboxes
@@ -690,6 +746,10 @@ async function handleSendEmail(request, env, fromAddress, ctx) {
   )
   if (!allowed) return error(`Daily send limit reached (${account.limits.max_sends_per_day}). Upgrade your plan.`, 429, env)
 
+  // Global send cap — protects against runaway Mailgun bills
+  const globalSendOk = await checkRateLimit(`global:sends:${new Date().toISOString().slice(0, 10)}`, GLOBAL_LIMITS.max_sends_per_day, 86400, env)
+  if (!globalSendOk) return error('Service sending capacity reached for today. Please try again tomorrow.', 503, env)
+
   let body
   try { body = await request.json() } catch { return error('Invalid JSON body', 400, env) }
 
@@ -852,6 +912,15 @@ async function handleSetWebhooks(request, env) {
   return json({ message: 'Webhooks updated', webhooks: account.webhooks }, 200, env)
 }
 
+// Verify Mailgun webhook signature
+async function verifyMailgunSignature(timestamp, token, signature, apiKey) {
+  const encoded = new TextEncoder().encode(timestamp + token)
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(apiKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = await crypto.subtle.sign('HMAC', key, encoded)
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('')
+  return expected === signature
+}
+
 // POST /webhook/inbound — receive from Mailgun or other HTTP sources
 async function handleInboundEmail(request, env, ctx) {
   let recipient, sender, subject, bodyPlain, bodyHtml
@@ -860,6 +929,15 @@ async function handleInboundEmail(request, env, ctx) {
 
   if (contentType.includes('application/json')) {
     const body = await request.json()
+
+    // Verify Mailgun signature if API key is configured
+    if (env.MAILGUN_API_KEY && body.signature) {
+      const { timestamp, token, signature } = body.signature
+      if (!timestamp || !token || !signature) return error('Missing signature fields', 403, env)
+      const valid = await verifyMailgunSignature(timestamp, token, signature, env.MAILGUN_API_KEY)
+      if (!valid) return error('Invalid webhook signature', 403, env)
+    }
+
     recipient = body.to || body.recipient
     sender = body.from || body.sender
     subject = body.subject || '(no subject)'
@@ -867,6 +945,17 @@ async function handleInboundEmail(request, env, ctx) {
     bodyHtml = body.html || body['body-html'] || ''
   } else {
     const formData = await request.formData()
+
+    // Verify Mailgun signature if API key is configured
+    if (env.MAILGUN_API_KEY && formData.get('signature')) {
+      const timestamp = formData.get('timestamp')
+      const token = formData.get('token')
+      const signature = formData.get('signature')
+      if (!timestamp || !token || !signature) return error('Missing signature fields', 403, env)
+      const valid = await verifyMailgunSignature(timestamp, token, signature, env.MAILGUN_API_KEY)
+      if (!valid) return error('Invalid webhook signature', 403, env)
+    }
+
     recipient = formData.get('recipient') || formData.get('To')
     sender = formData.get('sender') || formData.get('from') || formData.get('From')
     subject = formData.get('subject') || formData.get('Subject') || '(no subject)'
@@ -920,6 +1009,55 @@ async function handleInboundEmail(request, env, ctx) {
   }
 
   return json({ message: 'Email received', id: msgId }, 200, env)
+}
+
+// GET /api/admin/stats
+async function handleAdminStats(request, env) {
+  const apiKey = getApiKey(request)
+  if (!apiKey || apiKey !== env.ADMIN_API_KEY) return error('Unauthorized', 401, env)
+
+  // Count accounts by listing KV keys with prefix "account:"
+  let totalAccounts = 0
+  let cursor = null
+  const plans = {}
+  const recentSignups = []
+
+  do {
+    const list = await env.ACCOUNTS.list({ prefix: 'account:', limit: 1000, cursor })
+    for (const key of list.keys) {
+      totalAccounts++
+      // Fetch account details for plan breakdown + recent signups
+      try {
+        const raw = await env.ACCOUNTS.get(key.name)
+        if (raw) {
+          const acct = JSON.parse(raw)
+          plans[acct.plan || 'free'] = (plans[acct.plan || 'free'] || 0) + 1
+          recentSignups.push({ id: acct.id, email: acct.email, plan: acct.plan, created_at: acct.created_at })
+        }
+      } catch { /* skip */ }
+    }
+    cursor = list.list_complete ? null : list.cursor
+  } while (cursor)
+
+  // Sort recent signups by date descending, keep last 10
+  recentSignups.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+  const recent = recentSignups.slice(0, 10)
+
+  // Count total mailboxes
+  let totalMailboxes = 0
+  let mbCursor = null
+  do {
+    const list = await env.MAILBOXES.list({ prefix: 'mailbox:', limit: 1000, cursor: mbCursor })
+    totalMailboxes += list.keys.length
+    mbCursor = list.list_complete ? null : list.cursor
+  } while (mbCursor)
+
+  return json({
+    total_accounts: totalAccounts,
+    total_mailboxes: totalMailboxes,
+    plans,
+    recent_signups: recent,
+  }, 200, env)
 }
 
 // GET /api/health
@@ -1011,12 +1149,22 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(env) })
     }
 
+    // Reject oversized request bodies
+    const contentLength = parseInt(request.headers.get('Content-Length') || '0')
+    if (contentLength > MAX_BODY_SIZE) {
+      return error('Request body too large (max 1MB)', 413, env)
+    }
+
     if (path === '/api/health') return handleHealth(env)
 
     try {
+      // Admin routes
+      if (path === '/api/admin/stats' && method === 'GET') return handleAdminStats(request, env)
+
       // Auth routes
       if (path === '/api/signup' && method === 'POST') return handleSignup(request, env)
       if (path === '/api/account' && method === 'GET') return handleGetAccount(request, env)
+      if (path === '/api/account/rotate-key' && method === 'POST') return handleRotateKey(request, env)
 
       // Webhook routes
       if (path === '/api/webhooks' && method === 'PUT') return handleSetWebhooks(request, env)
