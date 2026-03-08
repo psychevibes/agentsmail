@@ -962,6 +962,10 @@ async function handleSetWebhooks(request, env) {
 
 // Verify Mailgun webhook signature
 async function verifyMailgunSignature(timestamp, token, signature, apiKey) {
+  // Replay protection: reject timestamps older than 5 minutes
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp))
+  if (isNaN(age) || age > 300) return false
+
   const encoded = new TextEncoder().encode(timestamp + token)
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(apiKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
   const sig = await crypto.subtle.sign('HMAC', key, encoded)
