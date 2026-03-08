@@ -30,6 +30,27 @@ async function hashApiKey(key) {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+// Constant-time string comparison — prevents timing oracle attacks on secrets.
+// Uses HMAC with a fresh random key so equal inputs always take the same time.
+async function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw', crypto.getRandomValues(new Uint8Array(32)),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  )
+  const [sigA, sigB] = await Promise.all([
+    crypto.subtle.sign('HMAC', key, encoder.encode(a)),
+    crypto.subtle.sign('HMAC', key, encoder.encode(b)),
+  ])
+  const arrA = new Uint8Array(sigA)
+  const arrB = new Uint8Array(sigB)
+  // HMAC output length is fixed (32 bytes for SHA-256) — no length leak
+  let diff = 0
+  for (let i = 0; i < arrA.length; i++) diff |= arrA[i] ^ arrB[i]
+  return diff === 0
+}
+
 function generateId(len = 16) {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
   let id = ''
@@ -250,34 +271,55 @@ function deriveThreadId(messageId, inReplyTo, references) {
   return messageId || `<${generateId(16)}@${DOMAIN}>`
 }
 
-// ── Webhook delivery with retries ──
+// ── Webhook delivery with retries and HMAC signing ──
 async function fireWebhooks(account, event, payload, ctx) {
+  const accountSecret = account.webhook_secret || null
+
   if (!account.webhooks || account.webhooks.length === 0) {
     // Legacy single webhook support
     if (account.webhook_url) {
-      ctx.waitUntil(deliverWebhook(account.webhook_url, event, payload))
+      ctx.waitUntil(deliverWebhook(account.webhook_url, event, payload, accountSecret))
     }
     return
   }
 
   for (const wh of account.webhooks) {
     if (wh.events && wh.events.length > 0 && !wh.events.includes(event)) continue
-    ctx.waitUntil(deliverWebhook(wh.url, event, payload))
+    // Per-webhook secret overrides account-level secret if present
+    ctx.waitUntil(deliverWebhook(wh.url, event, payload, wh.secret || accountSecret))
   }
 }
 
-async function deliverWebhook(url, event, payload) {
+async function deliverWebhook(url, event, payload, secret) {
   const body = JSON.stringify({ event, timestamp: new Date().toISOString(), data: payload })
+
+  // FIX: Sign every outbound webhook with HMAC-SHA256 so receivers can verify authenticity.
+  // Consumers should validate: X-AgentsMail-Signature == "sha256=<hmac(body, webhook_secret)>"
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'AgentsMail-Webhook/2.0',
+  }
+
+  if (secret) {
+    try {
+      const key = await crypto.subtle.importKey(
+        'raw', new TextEncoder().encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      )
+      const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body))
+      const hexSig = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('')
+      headers['X-AgentsMail-Signature'] = `sha256=${hexSig}`
+    } catch (e) {
+      console.error('Failed to sign webhook:', e.message)
+    }
+  }
+
   const delays = [0, 2000, 10000] // immediate, 2s, 10s retries
 
   for (let attempt = 0; attempt < delays.length; attempt++) {
     if (delays[attempt] > 0) await new Promise(r => setTimeout(r, delays[attempt]))
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': 'AgentsMail-Webhook/2.0' },
-        body,
-      })
+      const res = await fetch(url, { method: 'POST', headers, body })
       if (res.ok || res.status < 500) return // success or client error (don't retry)
     } catch (e) {
       console.error(`Webhook attempt ${attempt + 1} failed for ${url}:`, e.message)
@@ -328,6 +370,9 @@ async function handleSignup(request, env) {
     mailboxes: [],
     webhooks: [],
     webhook_url: null,
+    // FIX: Per-account secret for signing outbound webhook payloads.
+    // Consumers verify: X-AgentsMail-Signature: sha256=<hmac(body, webhook_secret)>
+    webhook_secret: generateId(32),
     created_at: new Date().toISOString(),
     plan,
     limits: { ...PLANS[plan] },
@@ -366,7 +411,10 @@ async function handleGetAccount(request, env) {
   return json({
     id: account.id, email: account.email, name: account.name,
     mailboxes: account.mailboxes, webhooks: account.webhooks || [],
-    webhook_url: account.webhook_url, plan: account.plan, limits: account.limits,
+    webhook_url: account.webhook_url,
+    // Expose webhook_secret so account owners can verify incoming webhook signatures
+    webhook_secret: account.webhook_secret || null,
+    plan: account.plan, limits: account.limits,
     created_at: account.created_at,
   }, 200, env)
 }
@@ -923,6 +971,16 @@ async function verifyMailgunSignature(timestamp, token, signature, apiKey) {
 
 // POST /webhook/inbound — receive from Mailgun or other HTTP sources
 async function handleInboundEmail(request, env, ctx) {
+  // FIX: Check optional path-level inbound secret as a second factor.
+  // Set INBOUND_SECRET in your Worker environment to enable.
+  // Mailgun sends this via a custom header you configure in your routing rules.
+  if (env.INBOUND_SECRET) {
+    const providedSecret = request.headers.get('X-Inbound-Secret') || ''
+    if (!(await timingSafeEqual(providedSecret, env.INBOUND_SECRET))) {
+      return error('Unauthorized', 403, env)
+    }
+  }
+
   let recipient, sender, subject, bodyPlain, bodyHtml
 
   const contentType = request.headers.get('Content-Type') || ''
@@ -930,10 +988,13 @@ async function handleInboundEmail(request, env, ctx) {
   if (contentType.includes('application/json')) {
     const body = await request.json()
 
-    // Verify Mailgun signature if API key is configured
-    if (env.MAILGUN_API_KEY && body.signature) {
-      const { timestamp, token, signature } = body.signature
-      if (!timestamp || !token || !signature) return error('Missing signature fields', 403, env)
+    // FIX: When MAILGUN_API_KEY is set, signature is REQUIRED — not optional.
+    // Previously an attacker could omit signature fields entirely to bypass verification.
+    if (env.MAILGUN_API_KEY) {
+      const { timestamp, token, signature } = (body.signature || {})
+      if (!timestamp || !token || !signature) {
+        return error('Missing Mailgun signature fields', 403, env)
+      }
       const valid = await verifyMailgunSignature(timestamp, token, signature, env.MAILGUN_API_KEY)
       if (!valid) return error('Invalid webhook signature', 403, env)
     }
@@ -946,12 +1007,14 @@ async function handleInboundEmail(request, env, ctx) {
   } else {
     const formData = await request.formData()
 
-    // Verify Mailgun signature if API key is configured
-    if (env.MAILGUN_API_KEY && formData.get('signature')) {
+    // FIX: Same enforcement for multipart/form-data submissions from Mailgun.
+    if (env.MAILGUN_API_KEY) {
       const timestamp = formData.get('timestamp')
       const token = formData.get('token')
       const signature = formData.get('signature')
-      if (!timestamp || !token || !signature) return error('Missing signature fields', 403, env)
+      if (!timestamp || !token || !signature) {
+        return error('Missing Mailgun signature fields', 403, env)
+      }
       const valid = await verifyMailgunSignature(timestamp, token, signature, env.MAILGUN_API_KEY)
       if (!valid) return error('Invalid webhook signature', 403, env)
     }
@@ -1013,28 +1076,30 @@ async function handleInboundEmail(request, env, ctx) {
 
 // GET /api/admin/stats
 async function handleAdminStats(request, env) {
+  // FIX: Use constant-time comparison to prevent timing oracle on the admin key.
+  // Also gate explicitly when ADMIN_API_KEY is not configured.
   const apiKey = getApiKey(request)
-  if (!apiKey || apiKey !== env.ADMIN_API_KEY) return error('Unauthorized', 401, env)
+  if (!apiKey || !env.ADMIN_API_KEY || !(await timingSafeEqual(apiKey, env.ADMIN_API_KEY))) {
+    return error('Unauthorized', 401, env)
+  }
 
   // Count accounts by listing KV keys with prefix "account:"
   let totalAccounts = 0
-  let totalMessages = 0
   let cursor = null
   const plans = {}
   const recentSignups = []
-  const accountDetails = []
 
   do {
     const list = await env.ACCOUNTS.list({ prefix: 'account:', limit: 1000, cursor })
     for (const key of list.keys) {
       totalAccounts++
+      // Fetch account details for plan breakdown + recent signups
       try {
         const raw = await env.ACCOUNTS.get(key.name)
         if (raw) {
           const acct = JSON.parse(raw)
           plans[acct.plan || 'free'] = (plans[acct.plan || 'free'] || 0) + 1
           recentSignups.push({ id: acct.id, email: acct.email, plan: acct.plan, created_at: acct.created_at })
-          accountDetails.push(acct)
         }
       } catch { /* skip */ }
     }
@@ -1045,43 +1110,20 @@ async function handleAdminStats(request, env) {
   recentSignups.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
   const recent = recentSignups.slice(0, 10)
 
-  // Fetch per-account mailbox details with message counts
+  // Count total mailboxes
   let totalMailboxes = 0
-  const accountStats = []
-  for (const acct of accountDetails) {
-    const mailboxStats = []
-    let acctMsgCount = 0
-    for (const addr of (acct.mailboxes || [])) {
-      totalMailboxes++
-      try {
-        const mbRaw = await env.MAILBOXES.get(`mailbox:${addr}`)
-        if (mbRaw) {
-          const mb = JSON.parse(mbRaw)
-          const msgCount = (mb.messages || []).length
-          acctMsgCount += msgCount
-          totalMessages += msgCount
-          mailboxStats.push({ address: addr, message_count: msgCount, created_at: mb.created_at })
-        }
-      } catch { /* skip */ }
-    }
-    accountStats.push({
-      id: acct.id,
-      email: acct.email,
-      plan: acct.plan || 'free',
-      created_at: acct.created_at,
-      mailbox_count: (acct.mailboxes || []).length,
-      total_messages: acctMsgCount,
-      mailboxes: mailboxStats,
-    })
-  }
+  let mbCursor = null
+  do {
+    const list = await env.MAILBOXES.list({ prefix: 'mailbox:', limit: 1000, cursor: mbCursor })
+    totalMailboxes += list.keys.length
+    mbCursor = list.list_complete ? null : list.cursor
+  } while (mbCursor)
 
   return json({
     total_accounts: totalAccounts,
     total_mailboxes: totalMailboxes,
-    total_messages: totalMessages,
     plans,
     recent_signups: recent,
-    accounts: accountStats,
   }, 200, env)
 }
 
@@ -1269,4 +1311,4 @@ export default {
       return error('Internal server error', 500, env)
     }
   },
-}
+}

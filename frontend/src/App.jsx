@@ -719,7 +719,7 @@ function Dashboard({ apiKey, onLogout, showToast }) {
 // ── App ──
 function App() {
   const [view, setView] = useState('landing') // landing | auth | dashboard | docs
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('am_api_key') || '')
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem('am_session_key') || '')
   const [toastMsg, showToast] = useToast()
 
   useEffect(() => {
@@ -727,13 +727,13 @@ function App() {
   }, [])
 
   const handleAuth = (key) => {
-    localStorage.setItem('am_api_key', key)
+    sessionStorage.setItem('am_session_key', key)
     setApiKey(key)
     setView('dashboard')
   }
 
   const handleLogout = () => {
-    localStorage.removeItem('am_api_key')
+    sessionStorage.removeItem('am_session_key')
     setApiKey('')
     setView('landing')
   }
