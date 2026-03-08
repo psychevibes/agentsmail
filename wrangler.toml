@@ -20,6 +20,9 @@ pattern = "api.agentsmail.net"
 zone_name = "agentsmail.net"
 custom_domain = true
 
+[triggers]
+crons = ["0 8 * * *"]  # Daily at 8:00 AM UTC
+
 [vars]
 CORS_ORIGIN = "https://agentsmail.net"
 DOMAIN = "agentsmail.net"

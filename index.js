@@ -1495,4 +1495,79 @@ export default {
       return error('Internal server error', 500, env)
     }
   },
+
+  // ── Cron: Daily admin report ──
+  async scheduled(event, env, ctx) {
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+    const eventTypes = ['signup', 'email_sent', 'email_received', 'send_failure', 'auth_failure', 'auth_lockout', 'rate_limit_hit', 'oversized_request']
+
+    const stats = {}
+    for (const evt of eventTypes) {
+      try { stats[evt] = parseInt(await env.RATE_LIMITS.get(`stats:${yesterday}:${evt}`) || '0') }
+      catch { stats[evt] = 0 }
+    }
+
+    // Count accounts and mailboxes
+    let totalAccounts = 0, totalMailboxes = 0
+    let cursor = null
+    do {
+      const list = await env.ACCOUNTS.list({ prefix: 'account:', limit: 1000, cursor })
+      totalAccounts += list.keys.length
+      cursor = list.list_complete ? null : list.cursor
+    } while (cursor)
+    let mbCursor = null
+    do {
+      const list = await env.MAILBOXES.list({ prefix: 'mailbox:', limit: 1000, cursor: mbCursor })
+      totalMailboxes += list.keys.length
+      mbCursor = list.list_complete ? null : list.cursor
+    } while (mbCursor)
+
+    const adminEmail = env.ADMIN_EMAIL || 'orenplevin@gmail.com'
+    const mailgunDomain = env.MAILGUN_DOMAIN || DOMAIN
+    if (!env.MAILGUN_API_KEY) { console.error('No MAILGUN_API_KEY for daily report'); return }
+
+    const lines = [
+      `AgentsMail Daily Report — ${yesterday}`,
+      ``,
+      `Platform Totals:`,
+      `  Accounts: ${totalAccounts}`,
+      `  Mailboxes: ${totalMailboxes}`,
+      ``,
+      `Yesterday's Activity:`,
+      `  Signups:        ${stats.signup}`,
+      `  Emails sent:    ${stats.email_sent}`,
+      `  Emails received: ${stats.email_received}`,
+      `  Send failures:  ${stats.send_failure}`,
+      ``,
+      `Security Events:`,
+      `  Auth failures:     ${stats.auth_failure}`,
+      `  Auth lockouts:     ${stats.auth_lockout}`,
+      `  Rate limit hits:   ${stats.rate_limit_hit}`,
+      `  Oversized requests: ${stats.oversized_request}`,
+      ``,
+      `— AgentsMail Admin`,
+    ]
+
+    const hasSecurityEvents = stats.auth_failure > 0 || stats.auth_lockout > 0 || stats.rate_limit_hit > 0
+    const subject = hasSecurityEvents
+      ? `⚠️ AgentsMail Report ${yesterday} — security events detected`
+      : `AgentsMail Report ${yesterday} — ${stats.email_sent} sent, ${stats.email_received} received`
+
+    const body = new FormData()
+    body.append('from', `AgentsMail Admin <admin@${mailgunDomain}>`)
+    body.append('to', adminEmail)
+    body.append('subject', subject)
+    body.append('text', lines.join('\n'))
+
+    try {
+      await fetch(`https://api.eu.mailgun.net/v3/${mailgunDomain}/messages`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + btoa('api:' + env.MAILGUN_API_KEY) },
+        body,
+      })
+      console.log(`[CRON] Daily report sent to ${adminEmail} for ${yesterday}`)
+    } catch (e) {
+      console.error(`[CRON] Failed to send daily report: ${e.message}`)
+    }
+  },
 }
