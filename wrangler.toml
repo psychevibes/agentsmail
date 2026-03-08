@@ -21,6 +21,6 @@ zone_name = "agentsmail.net"
 custom_domain = true
 
 [vars]
-CORS_ORIGIN = "*"
+CORS_ORIGIN = "https://agentsmail.net"
 DOMAIN = "agentsmail.net"
 MAILGUN_DOMAIN = "agentsmail.net"

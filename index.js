@@ -22,6 +22,10 @@ const GLOBAL_LIMITS = {
 
 const MAX_BODY_SIZE = 1024 * 1024 // 1MB request body limit
 
+// Per-key read/search rate limits
+const READ_RATE_LIMIT = { limit: 120, windowSec: 60 }   // 120 reads per minute per API key
+const SEARCH_RATE_LIMIT = { limit: 30, windowSec: 60 }  // 30 searches per minute per API key
+
 // ── Helpers ──
 
 async function hashApiKey(key) {
@@ -924,6 +928,9 @@ async function handleSetWebhooks(request, env) {
     if (body.url && !body.url.startsWith('https://')) {
       return error('Webhook URL must use HTTPS', 400, env)
     }
+    if (body.url && isPrivateWebhookUrl(body.url)) {
+      return error('Webhook URL must not target private/internal networks', 400, env)
+    }
     account.webhook_url = body.url || null
     await saveAccount(account, env)
     return json({ message: body.url ? 'Webhook set' : 'Webhook removed', webhook_url: account.webhook_url }, 200, env)
@@ -940,6 +947,7 @@ async function handleSetWebhooks(request, env) {
 
   for (const wh of webhooks) {
     if (!wh.url || !wh.url.startsWith('https://')) return error('All webhook URLs must use HTTPS', 400, env)
+    if (isPrivateWebhookUrl(wh.url)) return error('Webhook URLs must not target private/internal networks', 400, env)
     if (wh.events && !Array.isArray(wh.events)) return error('"events" must be an array', 400, env)
     if (wh.events) {
       for (const ev of wh.events) {
@@ -958,6 +966,31 @@ async function handleSetWebhooks(request, env) {
   await saveAccount(account, env)
 
   return json({ message: 'Webhooks updated', webhooks: account.webhooks }, 200, env)
+}
+
+// Block webhook URLs targeting private/internal networks (SSRF protection)
+function isPrivateWebhookUrl(urlStr) {
+  try {
+    const u = new URL(urlStr)
+    const host = u.hostname.toLowerCase()
+    // Block localhost, link-local, and common internal hostnames
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') return true
+    if (host === '0.0.0.0' || host.endsWith('.local') || host.endsWith('.internal')) return true
+    // Block private IP ranges: 10.x, 172.16-31.x, 192.168.x, 169.254.x (link-local)
+    const parts = host.split('.')
+    if (parts.length === 4 && parts.every(p => /^\d+$/.test(p))) {
+      const [a, b] = parts.map(Number)
+      if (a === 10) return true
+      if (a === 172 && b >= 16 && b <= 31) return true
+      if (a === 192 && b === 168) return true
+      if (a === 169 && b === 254) return true
+      if (a === 127) return true
+      if (a === 0) return true
+    }
+    // Block non-standard ports commonly used for internal services
+    if (u.port && ['6379', '3306', '5432', '27017', '9200', '8500', '2379'].includes(u.port)) return true
+    return false
+  } catch { return true }
 }
 
 // Verify Mailgun webhook signature
@@ -1242,6 +1275,17 @@ export default {
 
       // Inbound email webhook
       if (path === '/webhook/inbound' && method === 'POST') return handleInboundEmail(request, env, ctx)
+
+      // Per-key rate limits on read/search endpoints
+      const apiKeyForRL = getApiKey(request)
+      if (apiKeyForRL && method === 'GET') {
+        const keyHash = (await hashApiKey(apiKeyForRL)).slice(0, 12)
+        const isSearch = path.endsWith('/search') || path === '/api/search'
+        const rl = isSearch ? SEARCH_RATE_LIMIT : READ_RATE_LIMIT
+        const rlKey = `rl:${isSearch ? 'search' : 'read'}:${keyHash}`
+        const allowed = await checkRateLimit(rlKey, rl.limit, rl.windowSec, env)
+        if (!allowed) return error('Rate limit exceeded. Try again shortly.', 429, env)
+      }
 
       // Search across all mailboxes
       if (path === '/api/search' && method === 'GET') return handleSearchAll(request, env)
