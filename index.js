@@ -9,7 +9,7 @@ const VERSION = '2.0.0'
 
 // ── Plan tiers ──
 const PLANS = {
-  free: { max_mailboxes: 5, max_messages_per_mailbox: 200, max_sends_per_day: 50, max_webhooks: 2 },
+  free: { max_mailboxes: 20, max_messages_per_mailbox: 200, max_sends_per_day: 50, max_webhooks: 2 },
   developer: { max_mailboxes: 25, max_messages_per_mailbox: 1000, max_sends_per_day: 500, max_webhooks: 5 },
   startup: { max_mailboxes: 100, max_messages_per_mailbox: 5000, max_sends_per_day: 5000, max_webhooks: 10 },
 }
